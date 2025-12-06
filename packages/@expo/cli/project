@@ -1,0 +1,3 @@
+expo init RideSafeMobile
+# choose blank (managed) template
+cd RideSafeMobile
