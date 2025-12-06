@@ -1,0 +1,4 @@
+expo install expo-location
+npm install react-native-gesture-handler react-native-reanimated
+# Optional (recommended) map support:
+expo install react-native-maps
