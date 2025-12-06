@@ -1,0 +1,495 @@
+// App.js
+import React, { useEffect, useRef, useState } from "react";
+import {
+  Alert,
+  Button,
+  Clipboard,
+  Modal,
+  Platform,
+  SafeAreaView,
+  ScrollView,
+  Share,
+  StyleSheet,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import * as Location from "expo-location";
+
+let MapView, Marker;
+try {
+  // Attempt to import react-native-maps if installed; otherwise we'll fallback to placeholder
+  // (If you installed react-native-maps via `expo install react-native-maps` this will work)
+  // eslint-disable-next-line global-require
+  MapView = require("react-native-maps").default;
+  // eslint-disable-next-line global-require
+  Marker = require("react-native-maps").Marker;
+} catch (e) {
+  MapView = null;
+  Marker = null;
+}
+
+export default function App() {
+  // Core state
+  const [pickup, setPickup] = useState("");
+  const [dropoff, setDropoff] = useState("");
+  const [scheduled, setScheduled] = useState(false);
+  const [ride, setRide] = useState(null);
+  const [requesting, setRequesting] = useState(false);
+  const [userLocation, setUserLocation] = useState(null);
+  const [isSharing, setIsSharing] = useState(false);
+  const [showSOSModal, setShowSOSModal] = useState(false);
+
+  // timers
+  const tripTimerRef = useRef(null);
+  const approachTimerRef = useRef(null);
+
+  // Mock drivers
+  const DRIVERS = [
+    { id: 1, name: "Amit", rating: 4.8, car: "Swift Dzire", plate: "MH12AB1234" },
+    { id: 2, name: "Priya", rating: 4.9, car: "Hyundai Aura", plate: "MH14CD5678" },
+    { id: 3, name: "Rakesh", rating: 4.7, car: "Tata Tiago", plate: "MH01EF9012" },
+  ];
+
+  useEffect(() => {
+    // Request permission and get location on mount
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        if (status !== "granted") {
+          console.warn("Location permission not granted");
+          return;
+        }
+        const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        setUserLocation({ lat: loc.coords.latitude, lng: loc.coords.longitude });
+      } catch (e) {
+        console.warn("Location error:", e.message || e);
+      }
+    })();
+
+    return () => {
+      // cleanup timers on unmount
+      if (tripTimerRef.current) clearInterval(tripTimerRef.current);
+      if (approachTimerRef.current) clearTimeout(approachTimerRef.current);
+    };
+  }, []);
+
+  // Haversine distance (km)
+  function haversineDistance(a, b) {
+    const toRad = (v) => (v * Math.PI) / 180;
+    const R = 6371;
+    const dLat = toRad(b.lat - a.lat);
+    const dLon = toRad(b.lng - a.lng);
+    const lat1 = toRad(a.lat);
+    const lat2 = toRad(b.lat);
+
+    const sinDLat = Math.sin(dLat / 2) ** 2;
+    const sinDLon = Math.sin(dLon / 2) ** 2;
+    const h = sinDLat + Math.cos(lat1) * Math.cos(lat2) * sinDLon;
+    return 2 * R * Math.asin(Math.sqrt(h));
+  }
+
+  // Deterministic small offset from strings so we can "fake" coords for demo
+  function hashToOffset(s) {
+    let h = 0;
+    for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) % 1000;
+    return (h % 50) / 100; // 0..0.49
+  }
+
+  // Estimate fare/ETA
+  function estimate(pickupAddr, dropoffAddr) {
+    const base = 40;
+    const perKm = 12;
+    let distanceKm = 5;
+
+    if (userLocation && pickupAddr && dropoffAddr) {
+      const pCoord = {
+        lat: userLocation.lat + hashToOffset(pickupAddr) - 0.25,
+        lng: userLocation.lng + hashToOffset(pickupAddr) - 0.25,
+      };
+      const dCoord = {
+        lat: userLocation.lat + hashToOffset(dropoffAddr) - 0.25,
+        lng: userLocation.lng + hashToOffset(dropoffAddr) - 0.25,
+      };
+      distanceKm = Math.max(0.5, haversineDistance(pCoord, dCoord));
+    } else {
+      // fallback to heuristic (like original web app)
+      distanceKm = Math.max(3, Math.min(18, (pickupAddr.length + dropoffAddr.length) % 20 + 3));
+    }
+
+    const fare = base + Math.round(perKm * distanceKm);
+    const etaMin = Math.max(3, Math.round(distanceKm * 2 + 1));
+    return { fare, etaMin, distanceKm: Math.round(distanceKm * 10) / 10 };
+  }
+
+  // Request ride (mock)
+  async function requestRide() {
+    if (!pickup.trim() || !dropoff.trim()) {
+      Alert.alert("Missing fields", "Please enter both pickup and dropoff addresses.");
+      return;
+    }
+    setRequesting(true);
+
+    setTimeout(() => {
+      const matched = DRIVERS[Math.floor(Math.random() * DRIVERS.length)];
+      const est = estimate(pickup, dropoff);
+
+      const newRide = {
+        id: Date.now(),
+        driver: matched,
+        pickup,
+        dropoff,
+        status: "driver_assigned",
+        etaMin: est.etaMin,
+        fare: est.fare,
+        distanceKm: est.distanceKm,
+        startedAt: null,
+      };
+
+      setRide(newRide);
+      setRequesting(false);
+
+      // clear old approach timer then set a new one
+      if (approachTimerRef.current) clearTimeout(approachTimerRef.current);
+      approachTimerRef.current = setTimeout(() => {
+        setRide((r) => (r ? { ...r, status: "arrived" } : r));
+      }, est.etaMin * 1000); // fast-forward for demo (1s = 1min)
+    }, 1200);
+  }
+
+  // Cancel ride
+  function cancelRide() {
+    if (!ride) return;
+    if (approachTimerRef.current) {
+      clearTimeout(approachTimerRef.current);
+      approachTimerRef.current = null;
+    }
+    if (tripTimerRef.current) {
+      clearInterval(tripTimerRef.current);
+      tripTimerRef.current = null;
+    }
+    setRide((r) => (r ? { ...r, status: "cancelled", cancelledAt: Date.now() } : r));
+    Alert.alert("Ride cancelled");
+  }
+
+  // Start trip
+  function startTrip() {
+    if (!ride) return;
+    setRide((r) => ({ ...r, status: "on_trip", startedAt: Date.now() }));
+
+    if (tripTimerRef.current) clearInterval(tripTimerRef.current);
+    tripTimerRef.current = setInterval(async () => {
+      // In production you'd send this update to your backend for live tracking
+      try {
+        const loc = await Location.getCurrentPositionAsync({ accuracy: Location.Accuracy.High });
+        console.log("Periodic location:", loc.coords);
+      } catch (e) {
+        console.warn("Periodic location error:", e);
+      }
+    }, 3000);
+  }
+
+  // Complete trip
+  function completeTrip() {
+    if (tripTimerRef.current) {
+      clearInterval(tripTimerRef.current);
+      tripTimerRef.current = null;
+    }
+    setRide((r) => (r ? { ...r, status: "completed", completedAt: Date.now() } : r));
+    Alert.alert("Trip completed — Thank you for using RideSafe!");
+  }
+
+  // Trigger SOS
+  function triggerSOS() {
+    setShowSOSModal(false);
+    // production: call your emergency backend & share live location
+    Alert.alert("SOS sent (mock)", "Emergency contacts and authorities notified (mock).");
+  }
+
+  // Share trip (native)
+  async function shareTrip() {
+    if (!ride) {
+      Alert.alert("No active ride", "There's no active ride to share.");
+      return;
+    }
+    const tripLink = `https://example.com/share/${ride.id}`;
+
+    try {
+      if (Platform.OS === "web") {
+        // web fallback
+        await Clipboard.setString(tripLink);
+        Alert.alert("Copied", "Trip link copied to clipboard.");
+        setIsSharing(true);
+      } else {
+        const result = await Share.share({
+          title: "My trip with RideSafe",
+          message: `I'm on a trip with ${ride.driver.name}. Track here: ${tripLink}`,
+          url: tripLink,
+        });
+        // result.action can be used to detect share result; we just mark sharing as done
+        setIsSharing(true);
+      }
+    } catch (e) {
+      console.warn("Share error:", e);
+      try {
+        await Clipboard.setString(tripLink);
+        Alert.alert("Copied", "Trip link copied to clipboard.");
+        setIsSharing(true);
+      } catch (ex) {
+        Alert.alert("Could not share", tripLink);
+      }
+    }
+  }
+
+  // Render map area (map or placeholder)
+  function renderMap() {
+    if (MapView) {
+      const initialRegion = {
+        latitude: userLocation ? userLocation.lat : 12.9716,
+        longitude: userLocation ? userLocation.lng : 77.5946,
+        latitudeDelta: 0.05,
+        longitudeDelta: 0.05,
+      };
+      return (
+        <MapView style={styles.map} initialRegion={initialRegion}>
+          {userLocation && <Marker coordinate={{ latitude: userLocation.lat, longitude: userLocation.lng }} title="You" />}
+          {ride && ride.status !== "completed" && ride.status !== "cancelled" && (
+            // simple mock marker for driver (we don't track actual driver coordinates)
+            <Marker
+              coordinate={{
+                latitude: (userLocation ? userLocation.lat : 12.9716) + 0.004,
+                longitude: (userLocation ? userLocation.lng : 77.5946) + 0.004,
+              }}
+              title={ride.driver.name}
+              description={ride.driver.car}
+            />
+          )}
+        </MapView>
+      );
+    }
+
+    return (
+      <View style={[styles.map, styles.mapPlaceholder]}>
+        <Text style={{ color: "#777" }}>Map placeholder — install react-native-maps for a live map</Text>
+      </View>
+    );
+  }
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <ScrollView contentContainerStyle={styles.scroll}>
+        <Text style={styles.title}>RideSafe</Text>
+        <Text style={styles.subtitle}>Book rides and travel with built-in safety features.</Text>
+
+        <View style={styles.card}>
+          <Text style={styles.label}>Pickup</Text>
+          <TextInput
+            style={styles.input}
+            value={pickup}
+            onChangeText={setPickup}
+            placeholder={userLocation ? "Use current location or type" : "Enter pickup address"}
+          />
+
+          <Text style={styles.label}>Dropoff</Text>
+          <TextInput style={styles.input} value={dropoff} onChangeText={setDropoff} placeholder="Enter destination" />
+
+          <View style={styles.row}>
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <TouchableOpacity onPress={() => setScheduled((s) => !s)} style={styles.checkbox}>
+                <Text style={styles.checkboxText}>{scheduled ? "✓" : ""}</Text>
+              </TouchableOpacity>
+              <Text style={{ marginLeft: 8 }}>Schedule</Text>
+            </View>
+
+            <TouchableOpacity
+              onPress={requestRide}
+              disabled={requesting}
+              style={[styles.primaryButton, requesting && { opacity: 0.6 }]}
+            >
+              <Text style={styles.primaryButtonText}>{requesting ? "Requesting..." : "Request Ride"}</Text>
+            </TouchableOpacity>
+          </View>
+
+          {pickup && dropoff && (
+            <View style={{ marginTop: 12 }}>
+              <Text style={{ color: "#333" }}>
+                <Text style={{ fontWeight: "700" }}>Estimate: </Text>
+                {(() => {
+                  const e = estimate(pickup, dropoff);
+                  return `${e.distanceKm} km • ₹${e.fare} • ETA ${e.etaMin} min`;
+                })()}
+              </Text>
+            </View>
+          )}
+
+          <View style={{ marginTop: 14, flexDirection: "row", justifyContent: "space-between" }}>
+            <TouchableOpacity onPress={() => setShowSOSModal(true)} style={[styles.actionBtn, { backgroundColor: "#E53E3E" }]}>
+              <Text style={styles.actionBtnText}>SOS</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity onPress={shareTrip} style={[styles.actionBtn, { backgroundColor: "#F6E05E" }]}>
+              <Text style={[styles.actionBtnText, { color: "#111" }]}>Share Trip</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              onPress={() =>
+                Alert.alert("Safety tips", "- Share your trip with a trusted contact.\n- Verify driver details before boarding.\n- Sit in the backseat if possible.")
+              }
+              style={[styles.actionBtn, { backgroundColor: "#E2E8F0" }]}
+            >
+              <Text style={[styles.actionBtnText, { color: "#111" }]}>Tips</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+
+        <View style={styles.card}>
+          {renderMap()}
+
+          <View style={{ marginTop: 12 }}>
+            {!ride && <Text style={{ color: "#666" }}>No active ride. Request one to see driver details.</Text>}
+
+            {ride && (
+              <View style={styles.rideCard}>
+                <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+                  <View>
+                    <Text style={{ fontWeight: "700" }}>
+                      {ride.driver.name} — {ride.driver.car}
+                    </Text>
+                    <Text style={{ color: "#666", marginTop: 4 }}>
+                      Plate: {ride.driver.plate} • Rating: {ride.driver.rating}
+                    </Text>
+                  </View>
+
+                  <View style={{ alignItems: "flex-end" }}>
+                    <Text style={{ fontWeight: "600" }}>₹{ride.fare}</Text>
+                    <Text style={{ color: "#666", marginTop: 4 }}>{ride.etaMin} min</Text>
+                  </View>
+                </View>
+
+                <View style={{ marginTop: 12 }}>
+                  <Text>
+                    <Text style={{ fontWeight: "700" }}>From: </Text>
+                    {ride.pickup}
+                  </Text>
+                  <Text style={{ marginTop: 6 }}>
+                    <Text style={{ fontWeight: "700" }}>To: </Text>
+                    {ride.dropoff}
+                  </Text>
+                </View>
+
+                <View style={{ marginTop: 12, flexDirection: "row", gap: 8 }}>
+                  {ride.status === "driver_assigned" && (
+                    <>
+                      <TouchableOpacity
+                        onPress={() => setRide((r) => ({ ...r, status: "on_way" }))}
+                        style={[styles.primaryButton, { flex: 1 }]}
+                      >
+                        <Text style={styles.primaryButtonText}>Driver on the way</Text>
+                      </TouchableOpacity>
+
+                      <TouchableOpacity onPress={cancelRide} style={[styles.secondaryButton, { flex: 1 }]}>
+                        <Text style={styles.secondaryButtonText}>Cancel</Text>
+                      </TouchableOpacity>
+                    </>
+                  )}
+
+                  {ride.status === "arrived" && (
+                    <TouchableOpacity onPress={startTrip} style={[styles.primaryButton, { flex: 1 }]}>
+                      <Text style={styles.primaryButtonText}>Start Trip</Text>
+                    </TouchableOpacity>
+                  )}
+
+                  {ride.status === "on_trip" && (
+                    <TouchableOpacity onPress={completeTrip} style={[styles.primaryButton, { flex: 1, backgroundColor: "#111" }]}>
+                      <Text style={[styles.primaryButtonText, { color: "#fff" }]}>Complete Trip</Text>
+                    </TouchableOpacity>
+                  )}
+
+                  {(ride.status === "completed" || ride.status === "cancelled") && (
+                    <View style={{ padding: 6 }}>
+                      <Text style={{ color: "#666" }}>Ride {ride.status}.</Text>
+                    </View>
+                  )}
+                </View>
+
+                <Text style={{ marginTop: 8, color: "#666", fontSize: 12 }}>Status: {ride.status}</Text>
+              </View>
+            )}
+          </View>
+
+          <View style={{ marginTop: 12, borderTopWidth: 1, borderTopColor: "#eee", paddingTop: 12, flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+            <Text style={{ color: "#666" }}>
+              Live location: {userLocation ? `${userLocation.lat.toFixed(4)}, ${userLocation.lng.toFixed(4)}` : "Unavailable"}
+            </Text>
+
+            <View style={{ flexDirection: "row" }}>
+              <TouchableOpacity onPress={() => setShowSOSModal(true)} style={[styles.smallBtn, { backgroundColor: "#E53E3E" }]}>
+                <Text style={{ color: "#fff" }}>SOS</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity onPress={shareTrip} style={[styles.smallBtn, { backgroundColor: "#F6E05E", marginLeft: 8 }]}>
+                <Text style={{ color: "#111" }}>Share</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+
+        <View style={{ marginBottom: 60 }}>
+          <Text style={{ color: "#999", fontSize: 12, textAlign: "center" }}>
+            Integration notes: install react-native-maps for map display, geocode addresses for accurate routing, and add a backend (Firebase/REST) for persistent rides & SOS workflows.
+          </Text>
+        </View>
+      </ScrollView>
+
+      {/* SOS Modal */}
+      <Modal visible={showSOSModal} transparent animationType="fade">
+        <View style={styles.modalBack}>
+          <View style={styles.modalCard}>
+            <Text style={{ fontSize: 18, color: "#E53E3E", fontWeight: "700" }}>Emergency — Send SOS?</Text>
+            <Text style={{ marginTop: 8, color: "#666" }}>
+              This will notify your emergency contacts and send live location updates until you cancel. Use only in real emergencies.
+            </Text>
+
+            <View style={{ flexDirection: "row", marginTop: 14 }}>
+              <TouchableOpacity onPress={() => setShowSOSModal(false)} style={[styles.secondaryButton, { flex: 1 }]}>
+                <Text style={styles.secondaryButtonText}>Cancel</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity onPress={triggerSOS} style={[styles.primaryButton, { flex: 1, marginLeft: 8, backgroundColor: "#E53E3E" }]}>
+                <Text style={[styles.primaryButtonText, { color: "#fff" }]}>Send SOS</Text>
+              </TouchableOpacity>
+            </View>
+
+            <Text style={{ marginTop: 10, color: "#999", fontSize: 12 }}>Tip: call local emergency services as well if needed.</Text>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: "#F7FAFC" },
+  scroll: { padding: 16, paddingBottom: 40 },
+  title: { fontSize: 28, fontWeight: "700" },
+  subtitle: { marginTop: 4, color: "#718096" },
+  card: { marginTop: 14, backgroundColor: "#fff", borderRadius: 12, padding: 12, shadowColor: "#000", shadowOpacity: 0.03, elevation: 1 },
+  label: { marginTop: 12, color: "#718096", fontSize: 12 },
+  input: { marginTop: 6, borderWidth: 1, borderColor: "#E2E8F0", padding: 10, borderRadius: 8 },
+  row: { marginTop: 12, flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  checkbox: { width: 26, height: 26, borderRadius: 6, borderWidth: 1, borderColor: "#CBD5E0", alignItems: "center", justifyContent: "center" },
+  checkboxText: { fontWeight: "700" },
+  primaryButton: { backgroundColor: "#3182CE", paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8 },
+  primaryButtonText: { color: "#fff", fontWeight: "700", textAlign: "center" },
+  secondaryButton: { backgroundColor: "#EDF2F7", paddingVertical: 10, paddingHorizontal: 14, borderRadius: 8, alignItems: "center", justifyContent: "center" },
+  secondaryButtonText: { color: "#111", fontWeight: "700" },
+  actionBtn: { flex: 1, borderRadius: 8, paddingVertical: 10, alignItems: "center", justifyContent: "center" },
+  actionBtnText: { color: "#fff", fontWeight: "700" },
+  map: { width: "100%", height: 200, borderRadius: 8, overflow: "hidden" },
+  mapPlaceholder: { alignItems: "center", justifyContent: "center", backgroundColor: "#F1F5F9" },
+  rideCard: { marginTop: 10, padding: 8, borderRadius: 8, borderWidth: 1, borderColor: "#EDF2F7" },
+  smallBtn: { paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8, alignItems: "center", justifyContent: "center" },
+  modalBack: { flex: 1, backgroundColor: "rgba(0,0,0,0.45)", alignItems: "center", justifyContent: "center" },
+  modalCard: { width: "90%", backgroundColor: "#fff", padding: 16, borderRadius: 10 },
+});
